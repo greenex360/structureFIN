@@ -63,6 +63,7 @@ export default function TeamChatWidget() {
   const [teamError, setTeamError] = useState('')
   const [messagesError, setMessagesError] = useState('')
   const listRef = useRef<HTMLDivElement>(null)
+  const seenMessageIdsRef = useRef<Set<string> | null>(null)
 
   // ── Voice call state ──
   const [callState, setCallState] = useState<CallState>('idle')
@@ -77,8 +78,12 @@ export default function TeamChatWidget() {
   const queuedCandidatesRef = useRef<any[]>([])
   const callStateRef = useRef<CallState>('idle')
   const remoteUserRef = useRef<typeof remoteUser>(null)
+  const currentUserIdRef = useRef<string | null>(null)
+  const openRef = useRef(false)
   callStateRef.current = callState
   remoteUserRef.current = remoteUser
+  currentUserIdRef.current = currentUserId
+  openRef.current = open
 
   useEffect(() => {
     loadIdentity()
@@ -112,14 +117,42 @@ export default function TeamChatWidget() {
   }
 
   useEffect(() => {
+    if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+      Notification.requestPermission()
+    }
+  }, [])
+
+  useEffect(() => {
     load()
     const timer = setInterval(load, 4000)
     return () => clearInterval(timer)
   }, [])
 
+  function notifyNewMessages(rows: ChatMessage[]) {
+    if (typeof Notification === 'undefined') return
+    const seen = seenMessageIdsRef.current
+    const currentIds = new Set(rows.map(r => r.id))
+    if (seen === null) {
+      // First load after mount — just record what's already there, don't
+      // fire a notification storm for messages sent before we were open.
+      seenMessageIdsRef.current = currentIds
+      return
+    }
+    const newOnes = rows.filter(r => !seen.has(r.id) && r.sender_id !== currentUserIdRef.current)
+    seenMessageIdsRef.current = currentIds
+    if (newOnes.length === 0 || Notification.permission !== 'granted') return
+    if (openRef.current && document.hasFocus()) return // already looking at the chat
+    for (const m of newOnes) {
+      const title = m.recipient_id === null ? `${m.sender?.name ?? 'Someone'} · Team Chat` : m.sender?.name ?? 'New message'
+      const n = new Notification(title, { body: m.message })
+      n.onclick = () => { window.focus(); n.close() }
+    }
+  }
+
   async function load() {
     try {
       const rows = await fetchMessages()
+      notifyNewMessages(rows)
       setMessages(rows)
       setMessagesError('')
     } catch (err: any) {
