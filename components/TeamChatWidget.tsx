@@ -7,6 +7,9 @@ import { fetchTeam } from '@/lib/finActivities'
 
 const LAST_READ_KEY = 'fin_chat_last_read_v2'
 const TEAM_KEY = 'team'
+const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }]
+
+type CallState = 'idle' | 'calling' | 'ringing' | 'connecting' | 'connected'
 
 function initials(name: string) {
   return name.split(' ').filter(Boolean).slice(0, 2).map(w => w[0].toUpperCase()).join('')
@@ -26,9 +29,31 @@ function loadLastReadMap(): Record<string, string> {
   try { return JSON.parse(localStorage.getItem(LAST_READ_KEY) ?? '{}') } catch { return {} }
 }
 
+function durationLabel(seconds: number) {
+  const m = Math.floor(seconds / 60)
+  const s = seconds % 60
+  return `${m}:${String(s).padStart(2, '0')}`
+}
+
+async function sendSignal(targetUserId: string, event: string, payload: any) {
+  const ch = supabase.channel(`call-${targetUserId}`)
+  await new Promise<void>(resolve => {
+    ch.subscribe(status => {
+      if (status === 'SUBSCRIBED') {
+        ch.send({ type: 'broadcast', event, payload })
+        resolve()
+      } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+        resolve()
+      }
+    })
+  })
+  setTimeout(() => supabase.removeChannel(ch), 500)
+}
+
 export default function TeamChatWidget() {
   const [open, setOpen] = useState(false)
   const [currentUserId, setCurrentUserId] = useState<string | null>(null)
+  const [currentUserName, setCurrentUserName] = useState('')
   const [team, setTeam] = useState<any[]>([])
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [activeChat, setActiveChat] = useState<string>(TEAM_KEY)
@@ -37,11 +62,27 @@ export default function TeamChatWidget() {
   const [lastReadMap, setLastReadMap] = useState<Record<string, string>>(loadLastReadMap)
   const listRef = useRef<HTMLDivElement>(null)
 
+  // ── Voice call state ──
+  const [callState, setCallState] = useState<CallState>('idle')
+  const [remoteUser, setRemoteUser] = useState<{ id: string; name: string } | null>(null)
+  const [incomingCall, setIncomingCall] = useState<{ callId: string; fromId: string; fromName: string; sdp: any } | null>(null)
+  const [muted, setMuted] = useState(false)
+  const [callSeconds, setCallSeconds] = useState(0)
+  const pcRef = useRef<RTCPeerConnection | null>(null)
+  const localStreamRef = useRef<MediaStream | null>(null)
+  const remoteAudioRef = useRef<HTMLAudioElement>(null)
+  const callIdRef = useRef<string | null>(null)
+  const queuedCandidatesRef = useRef<any[]>([])
+  const callStateRef = useRef<CallState>('idle')
+  const remoteUserRef = useRef<typeof remoteUser>(null)
+  callStateRef.current = callState
+  remoteUserRef.current = remoteUser
+
   useEffect(() => {
     supabase.auth.getUser().then(async ({ data: { user } }) => {
       if (!user) return
-      const { data } = await supabase.from('users').select('id').eq('email', user.email).single()
-      if (data) setCurrentUserId(data.id)
+      const { data } = await supabase.from('users').select('id, name').eq('email', user.email).single()
+      if (data) { setCurrentUserId(data.id); setCurrentUserName(data.name) }
     })
     fetchTeam().then(setTeam)
   }, [])
@@ -128,13 +169,223 @@ export default function TeamChatWidget() {
     ? 'Team'
     : otherTeam.find((t: any) => t.user_id === activeChat)?.user?.name ?? 'Direct Message'
 
+  // ── Voice call wiring ──
+
+  useEffect(() => {
+    if (!currentUserId) return
+    const channel = supabase.channel(`call-${currentUserId}`)
+    channel
+      .on('broadcast', { event: 'offer' }, ({ payload }) => {
+        if (callStateRef.current !== 'idle') {
+          sendSignal(payload.fromId, 'busy', { callId: payload.callId })
+          return
+        }
+        setIncomingCall({ callId: payload.callId, fromId: payload.fromId, fromName: payload.fromName, sdp: payload.sdp })
+        setCallState('ringing')
+      })
+      .on('broadcast', { event: 'answer' }, async ({ payload }) => {
+        if (payload.callId !== callIdRef.current || !pcRef.current) return
+        await pcRef.current.setRemoteDescription(new RTCSessionDescription(payload.sdp))
+        for (const c of queuedCandidatesRef.current) {
+          try { await pcRef.current.addIceCandidate(new RTCIceCandidate(c)) } catch {}
+        }
+        queuedCandidatesRef.current = []
+        setCallState('connected')
+      })
+      .on('broadcast', { event: 'ice-candidate' }, async ({ payload }) => {
+        if (payload.callId !== callIdRef.current) return
+        if (pcRef.current?.remoteDescription) {
+          try { await pcRef.current.addIceCandidate(new RTCIceCandidate(payload.candidate)) } catch {}
+        } else {
+          queuedCandidatesRef.current.push(payload.candidate)
+        }
+      })
+      .on('broadcast', { event: 'hangup' }, ({ payload }) => {
+        if (payload.callId !== callIdRef.current) return
+        endCall(false)
+      })
+      .on('broadcast', { event: 'decline' }, ({ payload }) => {
+        if (payload.callId !== callIdRef.current) return
+        endCall(false)
+      })
+      .on('broadcast', { event: 'busy' }, ({ payload }) => {
+        if (payload.callId !== callIdRef.current) return
+        alert(`${remoteUserRef.current?.name ?? 'They'} are already on another call.`)
+        endCall(false)
+      })
+      .subscribe()
+    return () => { supabase.removeChannel(channel) }
+  }, [currentUserId])
+
+  useEffect(() => {
+    if (callState !== 'connected') { setCallSeconds(0); return }
+    const start = Date.now()
+    const timer = setInterval(() => setCallSeconds(Math.floor((Date.now() - start) / 1000)), 1000)
+    return () => clearInterval(timer)
+  }, [callState])
+
+  function createPeerConnection(targetUserId: string, callId: string) {
+    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
+    pc.onicecandidate = e => {
+      if (e.candidate) sendSignal(targetUserId, 'ice-candidate', { callId, candidate: e.candidate })
+    }
+    pc.ontrack = e => {
+      if (remoteAudioRef.current) remoteAudioRef.current.srcObject = e.streams[0]
+    }
+    pc.onconnectionstatechange = () => {
+      if (['disconnected', 'failed', 'closed'].includes(pc.connectionState) && callStateRef.current !== 'idle') {
+        endCall(false)
+      }
+    }
+    return pc
+  }
+
+  async function startCall(targetUserId: string, targetName: string) {
+    if (callState !== 'idle' || !currentUserId) return
+    const callId = crypto.randomUUID()
+    callIdRef.current = callId
+    setRemoteUser({ id: targetUserId, name: targetName })
+    setCallState('calling')
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      localStreamRef.current = stream
+      const pc = createPeerConnection(targetUserId, callId)
+      stream.getTracks().forEach(t => pc.addTrack(t, stream))
+      pcRef.current = pc
+      const offer = await pc.createOffer()
+      await pc.setLocalDescription(offer)
+      await sendSignal(targetUserId, 'offer', { callId, sdp: offer, fromId: currentUserId, fromName: currentUserName })
+    } catch (err: any) {
+      alert('Could not start call: ' + (err.message ?? 'microphone permission denied'))
+      endCall(false)
+    }
+  }
+
+  async function acceptCall() {
+    if (!incomingCall || !currentUserId) return
+    const { fromId, fromName, sdp, callId } = incomingCall
+    callIdRef.current = callId
+    setRemoteUser({ id: fromId, name: fromName })
+    setCallState('connecting')
+    setIncomingCall(null)
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      localStreamRef.current = stream
+      const pc = createPeerConnection(fromId, callId)
+      stream.getTracks().forEach(t => pc.addTrack(t, stream))
+      pcRef.current = pc
+      await pc.setRemoteDescription(new RTCSessionDescription(sdp))
+      for (const c of queuedCandidatesRef.current) {
+        try { await pc.addIceCandidate(new RTCIceCandidate(c)) } catch {}
+      }
+      queuedCandidatesRef.current = []
+      const answer = await pc.createAnswer()
+      await pc.setLocalDescription(answer)
+      await sendSignal(fromId, 'answer', { callId, sdp: answer })
+      setCallState('connected')
+    } catch (err: any) {
+      alert('Could not answer call: ' + (err.message ?? 'microphone permission denied'))
+      endCall(true)
+    }
+  }
+
+  function declineCall() {
+    if (!incomingCall) return
+    sendSignal(incomingCall.fromId, 'decline', { callId: incomingCall.callId })
+    setIncomingCall(null)
+    setCallState('idle')
+  }
+
+  function endCall(shouldNotify: boolean) {
+    if (shouldNotify && remoteUserRef.current && callIdRef.current) {
+      sendSignal(remoteUserRef.current.id, 'hangup', { callId: callIdRef.current })
+    }
+    pcRef.current?.close()
+    pcRef.current = null
+    localStreamRef.current?.getTracks().forEach(t => t.stop())
+    localStreamRef.current = null
+    queuedCandidatesRef.current = []
+    callIdRef.current = null
+    setCallState('idle')
+    setRemoteUser(null)
+    setIncomingCall(null)
+    setMuted(false)
+  }
+
+  function toggleMute() {
+    if (!localStreamRef.current) return
+    localStreamRef.current.getAudioTracks().forEach(t => { t.enabled = muted })
+    setMuted(m => !m)
+  }
+
   return (
-    <div className="fixed bottom-5 right-5 z-50">
+    <div className="fixed bottom-5 right-5 z-50 flex flex-col items-end gap-3">
+      <audio ref={remoteAudioRef} autoPlay />
+
+      {/* Incoming call — visible regardless of chat panel open/closed */}
+      {callState === 'ringing' && incomingCall && (
+        <div className="w-80 bg-white border border-[#2E6F5C] rounded-xl shadow-xl p-4 space-y-3">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-full bg-[#2E6F5C] text-white font-bold flex items-center justify-center animate-pulse">
+              {initials(incomingCall.fromName)}
+            </div>
+            <div>
+              <div className="font-semibold text-sm text-[#1C2320]">{incomingCall.fromName}</div>
+              <div className="text-xs text-[#5B665D]">Incoming voice call…</div>
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <button onClick={acceptCall} className="flex-1 px-3 py-2 bg-[#2E6F5C] text-white rounded-lg text-sm hover:bg-[#255A4A]">
+              📞 Accept
+            </button>
+            <button onClick={declineCall} className="flex-1 px-3 py-2 bg-[#B3472F] text-white rounded-lg text-sm hover:bg-[#94371F]">
+              ✕ Decline
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Outgoing / active call bar */}
+      {(callState === 'calling' || callState === 'connecting' || callState === 'connected') && remoteUser && (
+        <div className="w-80 bg-white border border-[#D7DCD1] rounded-xl shadow-xl p-4 space-y-3">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-full bg-[#2E6F5C] text-white font-bold flex items-center justify-center">
+              {initials(remoteUser.name)}
+            </div>
+            <div>
+              <div className="font-semibold text-sm text-[#1C2320]">{remoteUser.name}</div>
+              <div className="text-xs text-[#5B665D]">
+                {callState === 'calling' && 'Calling…'}
+                {callState === 'connecting' && 'Connecting…'}
+                {callState === 'connected' && durationLabel(callSeconds)}
+              </div>
+            </div>
+          </div>
+          <div className="flex gap-2">
+            {callState === 'connected' && (
+              <button onClick={toggleMute} className={`flex-1 px-3 py-2 rounded-lg text-sm border ${muted ? 'bg-[#F2E7D2] border-[#D9C295] text-[#8A6A1F]' : 'bg-white border-[#D7DCD1] text-[#5B665D]'}`}>
+                {muted ? '🔇 Unmute' : '🎙️ Mute'}
+              </button>
+            )}
+            <button onClick={() => endCall(true)} className="flex-1 px-3 py-2 bg-[#B3472F] text-white rounded-lg text-sm hover:bg-[#94371F]">
+              ✕ {callState === 'calling' ? 'Cancel' : 'End Call'}
+            </button>
+          </div>
+        </div>
+      )}
+
       {open && (
-        <div className="mb-3 w-80 sm:w-[420px] h-[520px] bg-white border border-[#D7DCD1] rounded-xl shadow-xl flex flex-col overflow-hidden">
+        <div className="w-80 sm:w-[420px] h-[520px] bg-white border border-[#D7DCD1] rounded-xl shadow-xl flex flex-col overflow-hidden">
           <div className="flex items-center justify-between px-4 py-3 bg-[#2E6F5C] text-white shrink-0">
             <span className="font-semibold text-sm">💬 {activeName}</span>
-            <button onClick={toggleOpen} className="text-white/80 hover:text-white text-sm">✕</button>
+            <div className="flex items-center gap-3">
+              {activeChat !== TEAM_KEY && callState === 'idle' && (
+                <button onClick={() => startCall(activeChat, activeName)} className="text-white/80 hover:text-white text-sm" title={`Call ${activeName}`}>
+                  📞
+                </button>
+              )}
+              <button onClick={toggleOpen} className="text-white/80 hover:text-white text-sm">✕</button>
+            </div>
           </div>
 
           <div className="flex gap-1.5 px-3 py-2 border-b border-[#EFF1EA] overflow-x-auto shrink-0">
