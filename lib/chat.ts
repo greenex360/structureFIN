@@ -12,7 +12,7 @@ export type ChatMessage = {
 export async function fetchMessages(limit = 300): Promise<ChatMessage[]> {
   const { data, error } = await supabase
     .from('fin_messages')
-    .select('id, message, created_at, sender_id, recipient_id, sender:users(id, name, email)')
+    .select('id, message, created_at, sender_id, recipient_id, sender:users!fin_messages_sender_id_fkey(id, name, email)')
     .order('created_at', { ascending: true })
     .limit(limit)
   if (error) throw new Error(`Could not load messages: ${error.message}`)

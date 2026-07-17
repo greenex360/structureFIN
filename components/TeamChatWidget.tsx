@@ -60,7 +60,8 @@ export default function TeamChatWidget() {
   const [draft, setDraft] = useState('')
   const [sending, setSending] = useState(false)
   const [lastReadMap, setLastReadMap] = useState<Record<string, string>>(loadLastReadMap)
-  const [loadError, setLoadError] = useState('')
+  const [teamError, setTeamError] = useState('')
+  const [messagesError, setMessagesError] = useState('')
   const listRef = useRef<HTMLDivElement>(null)
 
   // ── Voice call state ──
@@ -89,12 +90,12 @@ export default function TeamChatWidget() {
   async function loadIdentity() {
     try {
       const { data: { user } } = await supabase.auth.getUser()
-      if (!user) { setLoadError('Not signed in — please refresh the page.'); return }
+      if (!user) { setTeamError('Not signed in — please refresh the page.'); return }
       const { data, error } = await supabase.from('users').select('id, name').eq('email', user.email).single()
       if (error) throw error
       if (data) { setCurrentUserId(data.id); setCurrentUserName(data.name) }
     } catch (err: any) {
-      setLoadError('Could not load your session — try refreshing the page.')
+      setTeamError('Could not load your session — try refreshing the page.')
       console.error('[TeamChatWidget] identity load failed:', err)
     }
   }
@@ -103,9 +104,9 @@ export default function TeamChatWidget() {
     try {
       const rows = await fetchTeam()
       setTeam(rows)
-      setLoadError('')
+      setTeamError('')
     } catch (err: any) {
-      setLoadError(`Could not load team: ${err.message}`)
+      setTeamError(`Could not load team: ${err.message}`)
       console.error('[TeamChatWidget] team load failed:', err)
     }
   }
@@ -120,9 +121,9 @@ export default function TeamChatWidget() {
     try {
       const rows = await fetchMessages()
       setMessages(rows)
-      setLoadError('')
+      setMessagesError('')
     } catch (err: any) {
-      setLoadError(`Could not load messages: ${err.message}`)
+      setMessagesError(`Could not load messages: ${err.message}`)
       console.error('[TeamChatWidget] message load failed:', err)
     }
   }
@@ -414,10 +415,16 @@ export default function TeamChatWidget() {
             </div>
           </div>
 
-          {loadError && (
+          {teamError && (
             <div className="px-3 py-2 bg-[#F3E1DB] text-[#B3472F] text-xs shrink-0 flex items-center justify-between gap-2">
-              <span>⚠️ {loadError}</span>
+              <span>⚠️ {teamError}</span>
               <button onClick={loadTeam} className="underline shrink-0">Retry</button>
+            </div>
+          )}
+          {messagesError && (
+            <div className="px-3 py-2 bg-[#F3E1DB] text-[#B3472F] text-xs shrink-0 flex items-center justify-between gap-2">
+              <span>⚠️ {messagesError}</span>
+              <button onClick={load} className="underline shrink-0">Retry</button>
             </div>
           )}
 
