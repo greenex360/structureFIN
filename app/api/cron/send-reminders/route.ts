@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 import { Resend } from 'resend'
 
+const REMINDER_ROLES = ['Accounts Executive', 'Sr. Accounts Executive', 'Asst. Manager', 'Manager']
+
 function daysUntil(dateStr: string): number {
   const today = new Date(); today.setUTCHours(0, 0, 0, 0)
   const due = new Date(dateStr); due.setUTCHours(0, 0, 0, 0)
@@ -34,6 +36,13 @@ export async function GET(req: NextRequest) {
   const resend = new Resend(resendApiKey)
   const appUrl = process.env.NEXT_PUBLIC_APP_URL ?? ''
 
+  const { data: eligibleRoles } = await supabase
+    .from('fin_user_roles')
+    .select('user_id')
+    .in('fin_role', REMINDER_ROLES)
+    .eq('is_active', true)
+  const eligibleUserIds = new Set((eligibleRoles ?? []).map((r: any) => r.user_id))
+
   const { data: instances, error } = await supabase
     .from('fin_activity_instances')
     .select(`
@@ -61,6 +70,7 @@ export async function GET(req: NextRequest) {
     const left = daysUntil(row.due_date)
     if (!reminderDays.includes(left)) continue
     if (!row.assignee?.email) continue
+    if (!eligibleUserIds.has(row.assigned_to)) continue
 
     const { data: existing } = await supabase
       .from('fin_reminder_log')
