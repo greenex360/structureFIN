@@ -268,7 +268,9 @@ export default function TeamChatWidget() {
   }
 
   async function startCall(targetUserId: string, targetName: string) {
-    if (callState !== 'idle' || !currentUserId) return
+    if (!currentUserId) { alert('Not signed in yet — please refresh the page and try again.'); return }
+    if (callState !== 'idle') { alert('You are already in a call. End it before starting a new one.'); return }
+    if (!navigator.mediaDevices?.getUserMedia) { alert('This browser does not support voice calls (no microphone access API).'); return }
     const callId = crypto.randomUUID()
     callIdRef.current = callId
     setRemoteUser({ id: targetUserId, name: targetName })
@@ -407,8 +409,10 @@ export default function TeamChatWidget() {
             <span className="font-semibold text-sm">💬 {activeName}</span>
             <div className="flex items-center gap-3">
               {activeChat !== TEAM_KEY && callState === 'idle' && (
-                <button onClick={() => startCall(activeChat, activeName)} className="text-white/80 hover:text-white text-sm" title={`Call ${activeName}`}>
-                  📞
+                <button onClick={() => startCall(activeChat, activeName)}
+                  className="flex items-center gap-1 bg-white/15 hover:bg-white/25 px-2.5 py-1 rounded-full text-xs font-medium"
+                  title={`Call ${activeName}`}>
+                  📞 Call
                 </button>
               )}
               <button onClick={toggleOpen} className="text-white/80 hover:text-white text-sm">✕</button>
