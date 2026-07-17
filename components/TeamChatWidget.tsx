@@ -60,6 +60,7 @@ export default function TeamChatWidget() {
   const [draft, setDraft] = useState('')
   const [sending, setSending] = useState(false)
   const [lastReadMap, setLastReadMap] = useState<Record<string, string>>(loadLastReadMap)
+  const [loadError, setLoadError] = useState('')
   const listRef = useRef<HTMLDivElement>(null)
 
   // ── Voice call state ──
@@ -79,13 +80,35 @@ export default function TeamChatWidget() {
   remoteUserRef.current = remoteUser
 
   useEffect(() => {
-    supabase.auth.getUser().then(async ({ data: { user } }) => {
-      if (!user) return
-      const { data } = await supabase.from('users').select('id, name').eq('email', user.email).single()
-      if (data) { setCurrentUserId(data.id); setCurrentUserName(data.name) }
-    })
-    fetchTeam().then(setTeam)
+    loadIdentity()
+    loadTeam()
+    const teamTimer = setInterval(loadTeam, 15000)
+    return () => clearInterval(teamTimer)
   }, [])
+
+  async function loadIdentity() {
+    try {
+      const { data: { user } } = await supabase.auth.getUser()
+      if (!user) { setLoadError('Not signed in — please refresh the page.'); return }
+      const { data, error } = await supabase.from('users').select('id, name').eq('email', user.email).single()
+      if (error) throw error
+      if (data) { setCurrentUserId(data.id); setCurrentUserName(data.name) }
+    } catch (err: any) {
+      setLoadError('Could not load your session — try refreshing the page.')
+      console.error('[TeamChatWidget] identity load failed:', err)
+    }
+  }
+
+  async function loadTeam() {
+    try {
+      const rows = await fetchTeam()
+      setTeam(rows)
+      setLoadError('')
+    } catch (err: any) {
+      setLoadError(`Could not load team: ${err.message}`)
+      console.error('[TeamChatWidget] team load failed:', err)
+    }
+  }
 
   useEffect(() => {
     load()
@@ -97,8 +120,10 @@ export default function TeamChatWidget() {
     try {
       const rows = await fetchMessages()
       setMessages(rows)
-    } catch {
-      // silent — polling retry will pick it up
+      setLoadError('')
+    } catch (err: any) {
+      setLoadError(`Could not load messages: ${err.message}`)
+      console.error('[TeamChatWidget] message load failed:', err)
     }
   }
 
@@ -129,7 +154,8 @@ export default function TeamChatWidget() {
   }
 
   async function handleSend() {
-    if (!draft.trim() || !currentUserId) return
+    if (!draft.trim()) return
+    if (!currentUserId) { alert('Not signed in yet — please refresh the page and try again.'); return }
     setSending(true)
     try {
       await sendMessage(currentUserId, draft, activeChat === TEAM_KEY ? null : activeChat)
@@ -387,6 +413,13 @@ export default function TeamChatWidget() {
               <button onClick={toggleOpen} className="text-white/80 hover:text-white text-sm">✕</button>
             </div>
           </div>
+
+          {loadError && (
+            <div className="px-3 py-2 bg-[#F3E1DB] text-[#B3472F] text-xs shrink-0 flex items-center justify-between gap-2">
+              <span>⚠️ {loadError}</span>
+              <button onClick={loadTeam} className="underline shrink-0">Retry</button>
+            </div>
+          )}
 
           <div className="flex gap-1.5 px-3 py-2 border-b border-[#EFF1EA] overflow-x-auto shrink-0">
             <button onClick={() => switchChat(TEAM_KEY)}

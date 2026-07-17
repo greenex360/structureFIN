@@ -60,10 +60,11 @@ export async function fetchCompanies() {
 }
 
 export async function fetchTeam() {
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from('fin_user_roles')
     .select('user_id, fin_role, is_active, user:users(id, name, email)')
     .order('fin_role')
+  if (error) throw new Error(`Could not load team: ${error.message}`)
   return data ?? []
 }
 
