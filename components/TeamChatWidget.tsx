@@ -7,7 +7,14 @@ import { fetchTeam } from '@/lib/finActivities'
 
 const LAST_READ_KEY = 'fin_chat_last_read_v2'
 const TEAM_KEY = 'team'
-const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }]
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  // Free public TURN relay (Open Relay Project) - needed when both people
+  // aren't on the same network, which STUN alone often can't traverse.
+  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+]
 
 type CallState = 'idle' | 'calling' | 'ringing' | 'connecting' | 'connected'
 
@@ -35,19 +42,38 @@ function durationLabel(seconds: number) {
   return `${m}:${String(s).padStart(2, '0')}`
 }
 
-async function sendSignal(targetUserId: string, event: string, payload: any) {
+// Outgoing signaling channels are expensive to open (a full websocket
+// subscribe handshake each time), so we open ONE per call and reuse it for
+// every message (offer/answer/every ICE candidate/hangup) instead of
+// creating and tearing one down per message - that churn was dropping or
+// badly delaying ICE candidates, which is why calls could connect but carry
+// no audio.
+const outgoingChannels = new Map<string, ReturnType<typeof supabase.channel>>()
+
+async function getOutgoingChannel(targetUserId: string) {
+  const existing = outgoingChannels.get(targetUserId)
+  if (existing) return existing
   const ch = supabase.channel(`call-${targetUserId}`)
   await new Promise<void>(resolve => {
     ch.subscribe(status => {
-      if (status === 'SUBSCRIBED') {
-        ch.send({ type: 'broadcast', event, payload })
-        resolve()
-      } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
-        resolve()
-      }
+      if (status === 'SUBSCRIBED' || status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') resolve()
     })
   })
-  setTimeout(() => supabase.removeChannel(ch), 500)
+  outgoingChannels.set(targetUserId, ch)
+  return ch
+}
+
+function closeOutgoingChannel(targetUserId: string) {
+  const ch = outgoingChannels.get(targetUserId)
+  if (ch) {
+    supabase.removeChannel(ch)
+    outgoingChannels.delete(targetUserId)
+  }
+}
+
+async function sendSignal(targetUserId: string, event: string, payload: any) {
+  const ch = await getOutgoingChannel(targetUserId)
+  ch.send({ type: 'broadcast', event, payload })
 }
 
 export default function TeamChatWidget() {
@@ -80,6 +106,8 @@ export default function TeamChatWidget() {
   const remoteUserRef = useRef<typeof remoteUser>(null)
   const currentUserIdRef = useRef<string | null>(null)
   const openRef = useRef(false)
+  const ringAudioCtxRef = useRef<AudioContext | null>(null)
+  const ringIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   callStateRef.current = callState
   remoteUserRef.current = remoteUser
   currentUserIdRef.current = currentUserId
@@ -284,13 +312,57 @@ export default function TeamChatWidget() {
     return () => clearInterval(timer)
   }, [callState])
 
+  useEffect(() => {
+    if (callState === 'ringing') startRingtone()
+    else stopRingtone()
+    return stopRingtone
+  }, [callState])
+
+  function startRingtone() {
+    stopRingtone()
+    try {
+      const Ctx = window.AudioContext || (window as any).webkitAudioContext
+      const ctx = new Ctx()
+      ringAudioCtxRef.current = ctx
+      const beep = () => {
+        if (!ringAudioCtxRef.current) return
+        [0, 0.3].forEach(delay => {
+          const osc = ctx.createOscillator()
+          const gain = ctx.createGain()
+          osc.type = 'sine'
+          osc.frequency.value = 900
+          const t = ctx.currentTime + delay
+          gain.gain.setValueAtTime(0.0001, t)
+          gain.gain.exponentialRampToValueAtTime(0.25, t + 0.05)
+          gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.25)
+          osc.connect(gain)
+          gain.connect(ctx.destination)
+          osc.start(t)
+          osc.stop(t + 0.25)
+        })
+      }
+      beep()
+      ringIntervalRef.current = setInterval(beep, 1500)
+    } catch {
+      // Web Audio unavailable — silently skip the ringtone, the visual card still shows.
+    }
+  }
+
+  function stopRingtone() {
+    if (ringIntervalRef.current) { clearInterval(ringIntervalRef.current); ringIntervalRef.current = null }
+    if (ringAudioCtxRef.current) { ringAudioCtxRef.current.close().catch(() => {}); ringAudioCtxRef.current = null }
+  }
+
   function createPeerConnection(targetUserId: string, callId: string) {
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
     pc.onicecandidate = e => {
       if (e.candidate) sendSignal(targetUserId, 'ice-candidate', { callId, candidate: e.candidate })
     }
     pc.ontrack = e => {
-      if (remoteAudioRef.current) remoteAudioRef.current.srcObject = e.streams[0]
+      if (remoteAudioRef.current) {
+        remoteAudioRef.current.srcObject = e.streams[0]
+        remoteAudioRef.current.play().catch(() => {}) // autoplay can be blocked even with the attribute
+      }
     }
     pc.onconnectionstatechange = () => {
       if (['disconnected', 'failed', 'closed'].includes(pc.connectionState) && callStateRef.current !== 'idle') {
@@ -353,15 +425,19 @@ export default function TeamChatWidget() {
 
   function declineCall() {
     if (!incomingCall) return
-    sendSignal(incomingCall.fromId, 'decline', { callId: incomingCall.callId })
+    const fromId = incomingCall.fromId
+    sendSignal(fromId, 'decline', { callId: incomingCall.callId })
+    setTimeout(() => closeOutgoingChannel(fromId), 1000)
     setIncomingCall(null)
     setCallState('idle')
   }
 
   function endCall(shouldNotify: boolean) {
-    if (shouldNotify && remoteUserRef.current && callIdRef.current) {
-      sendSignal(remoteUserRef.current.id, 'hangup', { callId: callIdRef.current })
+    const targetId = remoteUserRef.current?.id
+    if (shouldNotify && targetId && callIdRef.current) {
+      sendSignal(targetId, 'hangup', { callId: callIdRef.current })
     }
+    if (targetId) setTimeout(() => closeOutgoingChannel(targetId), 1000)
     pcRef.current?.close()
     pcRef.current = null
     localStreamRef.current?.getTracks().forEach(t => t.stop())
