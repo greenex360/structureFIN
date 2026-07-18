@@ -97,6 +97,8 @@ export default function TeamChatWidget() {
   const [incomingCall, setIncomingCall] = useState<{ callId: string; fromId: string; fromName: string; sdp: any } | null>(null)
   const [muted, setMuted] = useState(false)
   const [callSeconds, setCallSeconds] = useState(0)
+  const [iceDebug, setIceDebug] = useState('')
+  const [ringDebug, setRingDebug] = useState('')
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const localStreamRef = useRef<MediaStream | null>(null)
   const remoteAudioRef = useRef<HTMLAudioElement>(null)
@@ -354,7 +356,10 @@ export default function TeamChatWidget() {
       const Ctx = window.AudioContext || (window as any).webkitAudioContext
       const ctx = new Ctx()
       ringAudioCtxRef.current = ctx
-      if (ctx.state === 'suspended') ctx.resume().catch(() => {})
+      setRingDebug(`audio: ${ctx.state}`)
+      if (ctx.state === 'suspended') {
+        ctx.resume().then(() => setRingDebug(`audio: ${ctx.state} (resumed)`)).catch((err: any) => setRingDebug(`audio: resume failed — ${err?.message ?? err}`))
+      }
       const beep = () => {
         if (!ringAudioCtxRef.current) return
         [0, 0.3].forEach(delay => {
@@ -374,26 +379,41 @@ export default function TeamChatWidget() {
       }
       beep()
       ringIntervalRef.current = setInterval(beep, 1500)
-    } catch {
-      // Web Audio unavailable — silently skip the ringtone, the visual card still shows.
+    } catch (err: any) {
+      setRingDebug(`audio: failed to start — ${err?.message ?? err}`)
+      console.error('[call] ringtone failed:', err)
     }
   }
 
   function stopRingtone() {
     if (ringIntervalRef.current) { clearInterval(ringIntervalRef.current); ringIntervalRef.current = null }
     if (ringAudioCtxRef.current) { ringAudioCtxRef.current.close().catch(() => {}); ringAudioCtxRef.current = null }
+    setRingDebug('')
   }
 
   function createPeerConnection(targetUserId: string, callId: string) {
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
+    const localTypes = new Set<string>()
+    let candidateCount = 0
+    setIceDebug('gathering…')
     pc.onicecandidate = e => {
-      if (e.candidate) sendSignal(targetUserId, 'ice-candidate', { callId, candidate: e.candidate })
+      if (e.candidate) {
+        candidateCount++
+        const m = /typ (\w+)/.exec(e.candidate.candidate)
+        if (m) localTypes.add(m[1])
+        setIceDebug(`sent ${candidateCount} candidate${candidateCount === 1 ? '' : 's'} (${[...localTypes].join(', ') || '…'})`)
+        sendSignal(targetUserId, 'ice-candidate', { callId, candidate: e.candidate })
+      }
     }
     pc.ontrack = e => {
       if (remoteAudioRef.current) {
         remoteAudioRef.current.srcObject = e.streams[0]
         remoteAudioRef.current.play().catch(() => {}) // autoplay can be blocked even with the attribute
       }
+    }
+    pc.oniceconnectionstatechange = () => {
+      console.log('[call] iceConnectionState:', pc.iceConnectionState)
+      setIceDebug(prev => `ICE: ${pc.iceConnectionState} · ${prev.replace(/^ICE: \S+ · /, '')}`)
     }
     pc.onconnectionstatechange = () => {
       console.log('[call] connectionState:', pc.connectionState)
@@ -483,6 +503,7 @@ export default function TeamChatWidget() {
     setRemoteUser(null)
     setIncomingCall(null)
     setMuted(false)
+    setIceDebug('')
   }
 
   function toggleMute() {
@@ -505,6 +526,7 @@ export default function TeamChatWidget() {
             <div>
               <div className="font-semibold text-sm text-[#1C2320]">{incomingCall.fromName}</div>
               <div className="text-xs text-[#5B665D]">Incoming voice call…</div>
+              {ringDebug && <div className="text-[10px] text-[#8A9389] mt-0.5">{ringDebug}</div>}
             </div>
           </div>
           <div className="flex gap-2">
@@ -533,6 +555,9 @@ export default function TeamChatWidget() {
                 {callState === 'connected' && durationLabel(callSeconds)}
                 {callState === 'failed' && '⚠️ Call failed to connect — check your network'}
               </div>
+              {(callState === 'connecting' || callState === 'failed') && iceDebug && (
+                <div className="text-[10px] text-[#8A9389] mt-0.5">{iceDebug}</div>
+              )}
             </div>
           </div>
           <div className="flex gap-2">
