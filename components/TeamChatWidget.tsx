@@ -427,7 +427,20 @@ export default function TeamChatWidget() {
         const m = /typ (\w+)/.exec(e.candidate.candidate)
         if (m) localTypes.add(m[1])
         setSentDebug(`sent ${candidateCount} candidate${candidateCount === 1 ? '' : 's'} (${[...localTypes].join(', ') || '…'})`)
-        sendSignal(targetUserId, callId, 'ice-candidate', { callId, candidate: e.candidate })
+        // Explicitly extract fields rather than sending the RTCIceCandidate
+        // instance directly - sdpMid/sdpMLineIndex (needed to associate the
+        // candidate with the right media line) can silently fail to survive
+        // JSON serialization of the instance itself in some browsers, which
+        // would make every received candidate look fine but be unusable.
+        sendSignal(targetUserId, callId, 'ice-candidate', {
+          callId,
+          candidate: {
+            candidate: e.candidate.candidate,
+            sdpMid: e.candidate.sdpMid,
+            sdpMLineIndex: e.candidate.sdpMLineIndex,
+            usernameFragment: e.candidate.usernameFragment,
+          },
+        })
       }
     }
     pc.ontrack = e => {
@@ -471,7 +484,7 @@ export default function TeamChatWidget() {
       pcRef.current = pc
       const offer = await pc.createOffer()
       await pc.setLocalDescription(offer)
-      await sendSignal(targetUserId, callId, 'offer', { callId, sdp: offer, fromId: currentUserId, fromName: currentUserName })
+      await sendSignal(targetUserId, callId, 'offer', { callId, sdp: { type: offer.type, sdp: offer.sdp }, fromId: currentUserId, fromName: currentUserName })
     } catch (err: any) {
       alert('Could not start call: ' + (err.message ?? 'microphone permission denied'))
       endCall(false)
@@ -501,7 +514,7 @@ export default function TeamChatWidget() {
       queuedCandidatesRef.current = []
       const answer = await pc.createAnswer()
       await pc.setLocalDescription(answer)
-      await sendSignal(fromId, callId, 'answer', { callId, sdp: answer })
+      await sendSignal(fromId, callId, 'answer', { callId, sdp: { type: answer.type, sdp: answer.sdp } })
       // stays 'connecting' — onconnectionstatechange flips it to 'connected' once the peer connection actually succeeds
     } catch (err: any) {
       alert('Could not answer call: ' + (err.message ?? 'microphone permission denied'))
