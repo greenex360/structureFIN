@@ -161,6 +161,17 @@ export default function InstantUpdateModal({ instance, onClose, onSaved }: {
           </div>
         )}
 
+        {instance.comments && (
+          <div>
+            <label className="block text-xs font-medium text-[#5B665D] mb-1">Update History</label>
+            <div className="max-h-32 overflow-y-auto border border-[#D7DCD1] rounded-lg bg-[#F5F6F1] divide-y divide-[#EFF1EA]">
+              {instance.comments.split('\n---\n').reverse().map((entry: string, i: number) => (
+                <p key={i} className="px-3 py-1.5 text-xs text-[#1C2320] whitespace-pre-wrap">{entry}</p>
+              ))}
+            </div>
+          </div>
+        )}
+
         <div>
           <label className="block text-xs font-medium text-[#5B665D] mb-1">
             Update {commentRequired && <span className="text-[#B3472F]">* required for In Progress</span>}
