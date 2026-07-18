@@ -23,11 +23,27 @@ export default function InstantUpdateModal({ instance, onClose, onSaved }: {
   const [showChangeGroup, setShowChangeGroup] = useState(false)
   const [mainGroup, setMainGroup] = useState(instance.main_group ?? '')
 
+  const [currentUserName, setCurrentUserName] = useState('')
+
   useEffect(() => {
     if (showReassign && team.length === 0) fetchTeam().then(setTeam)
   }, [showReassign])
 
+  useEffect(() => {
+    supabase.auth.getUser().then(async ({ data: { user } }) => {
+      if (!user) return
+      const { data } = await supabase.from('users').select('name').eq('email', user.email).single()
+      if (data) setCurrentUserName(data.name)
+    })
+  }, [])
+
+  const commentRequired = status === 'in_progress'
+
   async function handleSave() {
+    if (commentRequired && !comment.trim()) {
+      alert('Please write an update before saving — an in-progress activity needs a note on what\'s been done.')
+      return
+    }
     setSaving(true)
     try {
       let evidenceUrl = instance.evidence_url ?? null
@@ -50,7 +66,9 @@ export default function InstantUpdateModal({ instance, onClose, onSaved }: {
         main_group: mainGroup || instance.main_group,
       }
       if (comment) {
-        payload.comments = instance.comments ? `${instance.comments}\n---\n${comment}` : comment
+        const stamp = new Date().toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true })
+        const entry = `[${currentUserName || 'Unknown'} — ${stamp}]: ${comment}`
+        payload.comments = instance.comments ? `${instance.comments}\n---\n${entry}` : entry
       }
       if (status === 'completed' && instance.status !== 'completed') {
         payload.completed_at = new Date().toISOString()
@@ -144,10 +162,12 @@ export default function InstantUpdateModal({ instance, onClose, onSaved }: {
         )}
 
         <div>
-          <label className="block text-xs font-medium text-[#5B665D] mb-1">Comment</label>
+          <label className="block text-xs font-medium text-[#5B665D] mb-1">
+            Update {commentRequired && <span className="text-[#B3472F]">* required for In Progress</span>}
+          </label>
           <textarea value={comment} onChange={e => setComment(e.target.value)} rows={2}
-            placeholder="Optional note..."
-            className="w-full border border-[#D7DCD1] rounded-lg px-3 py-2 text-sm" />
+            placeholder={commentRequired ? "What's been done so far?" : 'Optional note...'}
+            className={`w-full border rounded-lg px-3 py-2 text-sm ${commentRequired && !comment.trim() ? 'border-[#E3A996]' : 'border-[#D7DCD1]'}`} />
         </div>
 
         <div className="flex gap-3">
