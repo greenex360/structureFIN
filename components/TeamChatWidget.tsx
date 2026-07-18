@@ -58,11 +58,13 @@ function durationLabel(seconds: number) {
 // every message (offer/answer/every ICE candidate/hangup) instead of
 // creating and tearing one down per message - that churn was dropping or
 // badly delaying ICE candidates, which is why calls could connect but carry
-// no audio.
+// no audio. Keyed by callId (not targetUserId) so a delayed cleanup from a
+// just-ended call can never tear down the channel a brand new call to the
+// same person just started using.
 const outgoingChannels = new Map<string, ReturnType<typeof supabase.channel>>()
 
-async function getOutgoingChannel(targetUserId: string) {
-  const existing = outgoingChannels.get(targetUserId)
+async function getOutgoingChannel(targetUserId: string, callId: string) {
+  const existing = outgoingChannels.get(callId)
   if (existing) return existing
   const ch = supabase.channel(`call-${targetUserId}`)
   await new Promise<void>(resolve => {
@@ -70,20 +72,20 @@ async function getOutgoingChannel(targetUserId: string) {
       if (status === 'SUBSCRIBED' || status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') resolve()
     })
   })
-  outgoingChannels.set(targetUserId, ch)
+  outgoingChannels.set(callId, ch)
   return ch
 }
 
-function closeOutgoingChannel(targetUserId: string) {
-  const ch = outgoingChannels.get(targetUserId)
+function closeOutgoingChannel(callId: string) {
+  const ch = outgoingChannels.get(callId)
   if (ch) {
     supabase.removeChannel(ch)
-    outgoingChannels.delete(targetUserId)
+    outgoingChannels.delete(callId)
   }
 }
 
-async function sendSignal(targetUserId: string, event: string, payload: any) {
-  const ch = await getOutgoingChannel(targetUserId)
+async function sendSignal(targetUserId: string, callId: string, event: string, payload: any) {
+  const ch = await getOutgoingChannel(targetUserId, callId)
   ch.send({ type: 'broadcast', event, payload })
 }
 
@@ -108,8 +110,12 @@ export default function TeamChatWidget() {
   const [incomingCall, setIncomingCall] = useState<{ callId: string; fromId: string; fromName: string; sdp: any } | null>(null)
   const [muted, setMuted] = useState(false)
   const [callSeconds, setCallSeconds] = useState(0)
-  const [iceDebug, setIceDebug] = useState('')
+  const [sentDebug, setSentDebug] = useState('')
+  const [recvDebug, setRecvDebug] = useState('')
+  const [iceStateDebug, setIceStateDebug] = useState('')
   const [ringDebug, setRingDebug] = useState('')
+  const recvCountRef = useRef(0)
+  const recvTypesRef = useRef<Set<string>>(new Set())
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const localStreamRef = useRef<MediaStream | null>(null)
   const remoteAudioRef = useRef<HTMLAudioElement>(null)
@@ -278,7 +284,7 @@ export default function TeamChatWidget() {
     channel
       .on('broadcast', { event: 'offer' }, ({ payload }) => {
         if (callStateRef.current !== 'idle') {
-          sendSignal(payload.fromId, 'busy', { callId: payload.callId })
+          sendSignal(payload.fromId, payload.callId, 'busy', { callId: payload.callId })
           return
         }
         setIncomingCall({ callId: payload.callId, fromId: payload.fromId, fromName: payload.fromName, sdp: payload.sdp })
@@ -295,6 +301,10 @@ export default function TeamChatWidget() {
       })
       .on('broadcast', { event: 'ice-candidate' }, async ({ payload }) => {
         if (payload.callId !== callIdRef.current) return
+        recvCountRef.current++
+        const m = /typ (\w+)/.exec(payload.candidate?.candidate ?? '')
+        if (m) recvTypesRef.current.add(m[1])
+        setRecvDebug(`recv ${recvCountRef.current} candidate${recvCountRef.current === 1 ? '' : 's'} (${[...recvTypesRef.current].join(', ') || '…'})`)
         if (pcRef.current?.remoteDescription) {
           try { await pcRef.current.addIceCandidate(new RTCIceCandidate(payload.candidate)) } catch {}
         } else {
@@ -403,17 +413,21 @@ export default function TeamChatWidget() {
   }
 
   function createPeerConnection(targetUserId: string, callId: string, iceServers: RTCIceServer[]) {
+    recvCountRef.current = 0
+    recvTypesRef.current = new Set()
+    setRecvDebug('')
+    setIceStateDebug('')
     const pc = new RTCPeerConnection({ iceServers })
     const localTypes = new Set<string>()
     let candidateCount = 0
-    setIceDebug('gathering…')
+    setSentDebug('gathering…')
     pc.onicecandidate = e => {
       if (e.candidate) {
         candidateCount++
         const m = /typ (\w+)/.exec(e.candidate.candidate)
         if (m) localTypes.add(m[1])
-        setIceDebug(`sent ${candidateCount} candidate${candidateCount === 1 ? '' : 's'} (${[...localTypes].join(', ') || '…'})`)
-        sendSignal(targetUserId, 'ice-candidate', { callId, candidate: e.candidate })
+        setSentDebug(`sent ${candidateCount} candidate${candidateCount === 1 ? '' : 's'} (${[...localTypes].join(', ') || '…'})`)
+        sendSignal(targetUserId, callId, 'ice-candidate', { callId, candidate: e.candidate })
       }
     }
     pc.ontrack = e => {
@@ -424,7 +438,7 @@ export default function TeamChatWidget() {
     }
     pc.oniceconnectionstatechange = () => {
       console.log('[call] iceConnectionState:', pc.iceConnectionState)
-      setIceDebug(prev => `ICE: ${pc.iceConnectionState} · ${prev.replace(/^ICE: \S+ · /, '')}`)
+      setIceStateDebug(`ICE: ${pc.iceConnectionState}`)
     }
     pc.onconnectionstatechange = () => {
       console.log('[call] connectionState:', pc.connectionState)
@@ -457,7 +471,7 @@ export default function TeamChatWidget() {
       pcRef.current = pc
       const offer = await pc.createOffer()
       await pc.setLocalDescription(offer)
-      await sendSignal(targetUserId, 'offer', { callId, sdp: offer, fromId: currentUserId, fromName: currentUserName })
+      await sendSignal(targetUserId, callId, 'offer', { callId, sdp: offer, fromId: currentUserId, fromName: currentUserName })
     } catch (err: any) {
       alert('Could not start call: ' + (err.message ?? 'microphone permission denied'))
       endCall(false)
@@ -487,7 +501,7 @@ export default function TeamChatWidget() {
       queuedCandidatesRef.current = []
       const answer = await pc.createAnswer()
       await pc.setLocalDescription(answer)
-      await sendSignal(fromId, 'answer', { callId, sdp: answer })
+      await sendSignal(fromId, callId, 'answer', { callId, sdp: answer })
       // stays 'connecting' — onconnectionstatechange flips it to 'connected' once the peer connection actually succeeds
     } catch (err: any) {
       alert('Could not answer call: ' + (err.message ?? 'microphone permission denied'))
@@ -497,19 +511,20 @@ export default function TeamChatWidget() {
 
   function declineCall() {
     if (!incomingCall) return
-    const fromId = incomingCall.fromId
-    sendSignal(fromId, 'decline', { callId: incomingCall.callId })
-    setTimeout(() => closeOutgoingChannel(fromId), 1000)
+    const { fromId, callId } = incomingCall
+    sendSignal(fromId, callId, 'decline', { callId })
+    setTimeout(() => closeOutgoingChannel(callId), 1000)
     setIncomingCall(null)
     setCallState('idle')
   }
 
   function endCall(shouldNotify: boolean) {
     const targetId = remoteUserRef.current?.id
-    if (shouldNotify && targetId && callIdRef.current) {
-      sendSignal(targetId, 'hangup', { callId: callIdRef.current })
+    const thisCallId = callIdRef.current
+    if (shouldNotify && targetId && thisCallId) {
+      sendSignal(targetId, thisCallId, 'hangup', { callId: thisCallId })
     }
-    if (targetId) setTimeout(() => closeOutgoingChannel(targetId), 1000)
+    if (thisCallId) setTimeout(() => closeOutgoingChannel(thisCallId), 1000)
     pcRef.current?.close()
     pcRef.current = null
     localStreamRef.current?.getTracks().forEach(t => t.stop())
@@ -520,7 +535,9 @@ export default function TeamChatWidget() {
     setRemoteUser(null)
     setIncomingCall(null)
     setMuted(false)
-    setIceDebug('')
+    setSentDebug('')
+    setRecvDebug('')
+    setIceStateDebug('')
   }
 
   function toggleMute() {
@@ -572,8 +589,12 @@ export default function TeamChatWidget() {
                 {callState === 'connected' && durationLabel(callSeconds)}
                 {callState === 'failed' && '⚠️ Call failed to connect — check your network'}
               </div>
-              {(callState === 'connecting' || callState === 'failed') && iceDebug && (
-                <div className="text-[10px] text-[#8A9389] mt-0.5">{iceDebug}</div>
+              {(callState === 'connecting' || callState === 'failed') && (
+                <div className="text-[10px] text-[#8A9389] mt-0.5 space-y-0.5">
+                  {iceStateDebug && <div>{iceStateDebug}</div>}
+                  {sentDebug && <div>{sentDebug}</div>}
+                  {recvDebug ? <div>{recvDebug}</div> : <div className="text-[#B3472F]">recv: nothing from the other side yet</div>}
+                </div>
               )}
             </div>
           </div>
