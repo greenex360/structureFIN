@@ -16,7 +16,7 @@ const ICE_SERVERS = [
   { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
 ]
 
-type CallState = 'idle' | 'calling' | 'ringing' | 'connecting' | 'connected'
+type CallState = 'idle' | 'calling' | 'ringing' | 'connecting' | 'connected' | 'failed'
 
 function initials(name: string) {
   return name.split(' ').filter(Boolean).slice(0, 2).map(w => w[0].toUpperCase()).join('')
@@ -278,7 +278,7 @@ export default function TeamChatWidget() {
           try { await pcRef.current.addIceCandidate(new RTCIceCandidate(c)) } catch {}
         }
         queuedCandidatesRef.current = []
-        setCallState('connected')
+        setCallState('connecting') // becomes 'connected' once the peer connection actually succeeds
       })
       .on('broadcast', { event: 'ice-candidate' }, async ({ payload }) => {
         if (payload.callId !== callIdRef.current) return
@@ -318,12 +318,43 @@ export default function TeamChatWidget() {
     return stopRingtone
   }, [callState])
 
+  // If signaling completes but the actual peer connection never comes up
+  // (e.g. both sides behind NATs the TURN relay couldn't bridge), don't
+  // leave the UI stuck showing "Connecting..." forever with no explanation.
+  useEffect(() => {
+    if (callState !== 'connecting') return
+    const timeout = setTimeout(() => {
+      if (callStateRef.current === 'connecting') {
+        setCallState('failed')
+        setTimeout(() => endCall(false), 3000)
+      }
+    }, 20000)
+    return () => clearTimeout(timeout)
+  }, [callState])
+
+  // Web Audio (used for the ring tone) can be silently blocked by the
+  // browser until the page has seen at least one user interaction. Resume
+  // it as soon as that happens so a ring that started before any click
+  // still becomes audible.
+  useEffect(() => {
+    function resumeAudio() {
+      if (ringAudioCtxRef.current?.state === 'suspended') ringAudioCtxRef.current.resume().catch(() => {})
+    }
+    document.addEventListener('click', resumeAudio)
+    document.addEventListener('keydown', resumeAudio)
+    return () => {
+      document.removeEventListener('click', resumeAudio)
+      document.removeEventListener('keydown', resumeAudio)
+    }
+  }, [])
+
   function startRingtone() {
     stopRingtone()
     try {
       const Ctx = window.AudioContext || (window as any).webkitAudioContext
       const ctx = new Ctx()
       ringAudioCtxRef.current = ctx
+      if (ctx.state === 'suspended') ctx.resume().catch(() => {})
       const beep = () => {
         if (!ringAudioCtxRef.current) return
         [0, 0.3].forEach(delay => {
@@ -365,8 +396,12 @@ export default function TeamChatWidget() {
       }
     }
     pc.onconnectionstatechange = () => {
-      if (['disconnected', 'failed', 'closed'].includes(pc.connectionState) && callStateRef.current !== 'idle') {
-        endCall(false)
+      console.log('[call] connectionState:', pc.connectionState)
+      if (pc.connectionState === 'connected') {
+        setCallState('connected')
+      } else if (['disconnected', 'failed', 'closed'].includes(pc.connectionState) && callStateRef.current !== 'idle' && callStateRef.current !== 'failed') {
+        setCallState('failed')
+        setTimeout(() => endCall(false), 3000)
       }
     }
     return pc
@@ -416,7 +451,7 @@ export default function TeamChatWidget() {
       const answer = await pc.createAnswer()
       await pc.setLocalDescription(answer)
       await sendSignal(fromId, 'answer', { callId, sdp: answer })
-      setCallState('connected')
+      // stays 'connecting' — onconnectionstatechange flips it to 'connected' once the peer connection actually succeeds
     } catch (err: any) {
       alert('Could not answer call: ' + (err.message ?? 'microphone permission denied'))
       endCall(true)
@@ -484,18 +519,19 @@ export default function TeamChatWidget() {
       )}
 
       {/* Outgoing / active call bar */}
-      {(callState === 'calling' || callState === 'connecting' || callState === 'connected') && remoteUser && (
-        <div className="w-80 bg-white border border-[#D7DCD1] rounded-xl shadow-xl p-4 space-y-3">
+      {(callState === 'calling' || callState === 'connecting' || callState === 'connected' || callState === 'failed') && remoteUser && (
+        <div className={`w-80 bg-white border rounded-xl shadow-xl p-4 space-y-3 ${callState === 'failed' ? 'border-[#B3472F]' : 'border-[#D7DCD1]'}`}>
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-full bg-[#2E6F5C] text-white font-bold flex items-center justify-center">
               {initials(remoteUser.name)}
             </div>
             <div>
               <div className="font-semibold text-sm text-[#1C2320]">{remoteUser.name}</div>
-              <div className="text-xs text-[#5B665D]">
+              <div className={`text-xs ${callState === 'failed' ? 'text-[#B3472F] font-medium' : 'text-[#5B665D]'}`}>
                 {callState === 'calling' && 'Calling…'}
                 {callState === 'connecting' && 'Connecting…'}
                 {callState === 'connected' && durationLabel(callSeconds)}
+                {callState === 'failed' && '⚠️ Call failed to connect — check your network'}
               </div>
             </div>
           </div>
@@ -506,7 +542,7 @@ export default function TeamChatWidget() {
               </button>
             )}
             <button onClick={() => endCall(true)} className="flex-1 px-3 py-2 bg-[#B3472F] text-white rounded-lg text-sm hover:bg-[#94371F]">
-              ✕ {callState === 'calling' ? 'Cancel' : 'End Call'}
+              ✕ {callState === 'calling' ? 'Cancel' : callState === 'failed' ? 'Close' : 'End Call'}
             </button>
           </div>
         </div>
