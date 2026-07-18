@@ -7,6 +7,12 @@ import { fetchTeam } from '@/lib/finActivities'
 
 const LAST_READ_KEY = 'fin_chat_last_read_v2'
 const TEAM_KEY = 'team'
+// Paused: calls reliably fail once neither person can connect directly
+// (confirmed via on-screen diagnostics - both sides gather and exchange
+// relay candidates correctly, but ICE still fails), which looks like a
+// free-tier TURN relay-to-relay limitation. All the calling logic below is
+// left intact - flip this back on if the TURN plan changes.
+const VOICE_CALLING_ENABLED = false
 const FALLBACK_ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }]
 
 // Fetches fresh TURN credentials from our Metered.ca account before each
@@ -629,7 +635,7 @@ export default function TeamChatWidget() {
           <div className="flex items-center justify-between px-4 py-3 bg-[#2E6F5C] text-white shrink-0">
             <span className="font-semibold text-sm">💬 {activeName}</span>
             <div className="flex items-center gap-3">
-              {activeChat !== TEAM_KEY && callState === 'idle' && (
+              {VOICE_CALLING_ENABLED && activeChat !== TEAM_KEY && callState === 'idle' && (
                 <button onClick={() => startCall(activeChat, activeName)}
                   className="flex items-center gap-1 bg-white/15 hover:bg-white/25 px-2.5 py-1 rounded-full text-xs font-medium"
                   title={`Call ${activeName}`}>
