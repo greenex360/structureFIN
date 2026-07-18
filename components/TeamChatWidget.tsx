@@ -7,14 +7,25 @@ import { fetchTeam } from '@/lib/finActivities'
 
 const LAST_READ_KEY = 'fin_chat_last_read_v2'
 const TEAM_KEY = 'team'
-const ICE_SERVERS = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  // Free public TURN relay (Open Relay Project) - needed when both people
-  // aren't on the same network, which STUN alone often can't traverse.
-  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
-]
+const FALLBACK_ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }]
+
+// Fetches fresh TURN credentials from our Metered.ca account before each
+// call, rather than hardcoding servers - Metered's credentials are
+// short-lived and this is their documented usage pattern. Falls back to
+// STUN-only (direct connections still work on the same network) if the
+// fetch fails for any reason, so a Metered outage doesn't hard-break calls.
+async function fetchIceServers(): Promise<RTCIceServer[]> {
+  const apiKey = process.env.NEXT_PUBLIC_METERED_API_KEY
+  if (!apiKey) return FALLBACK_ICE_SERVERS
+  try {
+    const res = await fetch(`https://structurepay.metered.live/api/v1/turn/credentials?apiKey=${apiKey}`)
+    if (!res.ok) return FALLBACK_ICE_SERVERS
+    const servers = await res.json()
+    return Array.isArray(servers) && servers.length > 0 ? servers : FALLBACK_ICE_SERVERS
+  } catch {
+    return FALLBACK_ICE_SERVERS
+  }
+}
 
 type CallState = 'idle' | 'calling' | 'ringing' | 'connecting' | 'connected' | 'failed'
 
@@ -391,8 +402,8 @@ export default function TeamChatWidget() {
     setRingDebug('')
   }
 
-  function createPeerConnection(targetUserId: string, callId: string) {
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
+  function createPeerConnection(targetUserId: string, callId: string, iceServers: RTCIceServer[]) {
+    const pc = new RTCPeerConnection({ iceServers })
     const localTypes = new Set<string>()
     let candidateCount = 0
     setIceDebug('gathering…')
@@ -436,9 +447,12 @@ export default function TeamChatWidget() {
     setRemoteUser({ id: targetUserId, name: targetName })
     setCallState('calling')
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const [stream, iceServers] = await Promise.all([
+        navigator.mediaDevices.getUserMedia({ audio: true }),
+        fetchIceServers(),
+      ])
       localStreamRef.current = stream
-      const pc = createPeerConnection(targetUserId, callId)
+      const pc = createPeerConnection(targetUserId, callId, iceServers)
       stream.getTracks().forEach(t => pc.addTrack(t, stream))
       pcRef.current = pc
       const offer = await pc.createOffer()
@@ -458,9 +472,12 @@ export default function TeamChatWidget() {
     setCallState('connecting')
     setIncomingCall(null)
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const [stream, iceServers] = await Promise.all([
+        navigator.mediaDevices.getUserMedia({ audio: true }),
+        fetchIceServers(),
+      ])
       localStreamRef.current = stream
-      const pc = createPeerConnection(fromId, callId)
+      const pc = createPeerConnection(fromId, callId, iceServers)
       stream.getTracks().forEach(t => pc.addTrack(t, stream))
       pcRef.current = pc
       await pc.setRemoteDescription(new RTCSessionDescription(sdp))
